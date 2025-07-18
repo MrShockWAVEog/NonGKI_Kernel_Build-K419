@@ -9,18 +9,61 @@ on:
         options:
         - 'lancelot'
         - 'merlin'
+        - 'selene'
+      build_ksun:
+        description: 'Build KernelSU-Next A13+'
+        required: true
+        default: true
+        type: boolean
+      build_ksun_old:
+        description: 'Build KernelSU-Next A11+'
+        required: true
+        default: true
+        type: boolean
+      build_xxksu:
+        description: 'Build xxksu A13+'
+        required: true
+        default: true
+        type: boolean
+      build_xxksu_old:
+        description: 'Build xxksu A11+'
+        required: true
+        default: true
+        type: boolean
 
 jobs:
+  generate-build-matrix:
+    name: What to build?
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        name: Generate build matrix
+        run: |
+          targets=()
+          if [[ "${{ github.event.inputs.build_ksun }}" == "true" ]]; then targets+=("ksun"); fi
+          if [[ "${{ github.event.inputs.build_ksun_old }}" == "true" ]]; then targets+=("ksun-old"); fi
+          if [[ "${{ github.event.inputs.build_xxksu }}" == "true" ]]; then targets+=("xxksu"); fi
+          if [[ "${{ github.event.inputs.build_xxksu_old }}" == "true" ]]; then targets+=("xxksu-old"); fi
+          json=$(printf '%s\n' "${targets[@]}" | jq -R . | jq -s '{target: .}')
+          echo "matrix<<EOF" >> $GITHUB_OUTPUT
+          echo "$json" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
   build:
-    name: Build Kernel by ${{ github.actor }}
+    needs: generate-build-matrix
     runs-on: ubuntu-24.04
     env:
       DEVICE: ${{ github.event.inputs.select_device }}
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
       CCACHE_HARDLINK: "true"
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-build-matrix.outputs.matrix) }}
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Maximize build space
       if: env.REMOVE_UNUSED_PACKAGES == 'true'
@@ -35,7 +78,20 @@ jobs:
 
     - name: Prepare environment
       run: |
-        grep -v -E "^#|^\n" config.env | sed 's/ #.*//; s/#.*//' >> $GITHUB_ENV
+        TARGET_CONFIG_FILENAME="${{ matrix.target }}"
+        TARGET_CONFIG_FILENAME="${TARGET_CONFIG_FILENAME/-old/}"
+        TARGET_CONFIG_FILENAME_SUFFIX=$TARGET_CONFIG_FILENAME
+        grep -v -E "^#|^\n" config-${TARGET_CONFIG_FILENAME_SUFFIX}.env | sed 's/ #.*//; s/#.*//' >> $GITHUB_ENV
+        if [[ "${{ matrix.target }}" == *"-old" ]]; then
+            echo "ANDROID_TAG=[A11+]" >> $GITHUB_ENV
+        else
+            echo "ANDROID_TAG=[A13+]" >> $GITHUB_ENV
+        fi
+
+    - name: Check if old Android build
+      if: contains(matrix.target, 'old')
+      run: |
+        echo "OLD_ANDROID_SUPPORT=true" >> $GITHUB_ENV
 
     - name: Set swap to 10G
       uses: pierotofy/set-swap-space@master
@@ -44,7 +100,7 @@ jobs:
 
     - name: Setup kernel build environment
       run: |
-        echo "BUILD_TIME=$(TZ=UTC date "+%Y%m%d%H%M")" >> $GITHUB_ENV
+        echo "BUILD_TIME=$(TZ=Asia/Dhaka date "+%Y%m%d%H%M")" >> $GITHUB_ENV
         sudo apt-get update
         sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git git-lfs gnupg gperf imagemagick lib32ncurses-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses6 libncurses-dev libsdl1.2-dev libssl-dev libwxgtk3.2-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
@@ -184,7 +240,7 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         curl -LSs "$KERNELSU_SETUP_SOURCE" | bash -s ${{ env.KERNELSU_TAG }}
         KSU_VERSION="_$(cd $(echo "$KERNELSU_SETUP_SOURCE" | cut -d/ -f5) || cd KernelSU && expr $(git rev-list --count HEAD) + 10200)"
-        echo "UPLOADNAME=-$(echo "$KERNELSU_SETUP_SOURCE" | cut -d/ -f5)$KSU_VERSION" >> $GITHUB_ENV
+        echo "UPLOADNAME=-KernelSU-${{ matrix.target }}$KSU_VERSION" >> $GITHUB_ENV
         if [ ${{ env.KSU_REVERT }} = true ]; then
             git apply $GITHUB_WORKSPACE/patches/KSU_REVERT.patch
         fi
@@ -192,72 +248,112 @@ jobs:
     - name: Setup Configuration for kernel
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        if [ ${{ env.ENABLE_KERNELSU }} = true ]; then
-            if [ ${{ env.KSU_HOOKS_PATCH }} = true ]; then
+
+        BASE_CONFIG="arch/${{ env.KERNEL_ARCH }}/configs/${{ env.KERNEL_CONFIG_BASE }}"
+        DEVICE_CONFIG="arch/${{ env.KERNEL_ARCH }}/configs/${{ env.KERNEL_CONFIG_FRAGMENT_DIR }}/${DEVICE}.config"
+        KSU_CONFIG="arch/${{ env.KERNEL_ARCH }}/configs/${{ env.KERNELSU_CONFIG_FRAGMENT }}"
+
+        if [ ! -f "$BASE_CONFIG" ]; then
+            echo "Missing base config: $BASE_CONFIG"
+            exit 1
+        fi
+        if [ ! -f "$DEVICE_CONFIG" ]; then
+            echo "Missing device config: $DEVICE_CONFIG"
+            exit 1
+        fi
+        if [ "${{ env.ENABLE_KERNELSU }}" = true ] && [ ! -f "$KSU_CONFIG" ]; then
+            echo "Missing KernelSU config fragment: $KSU_CONFIG"
+            exit 1
+        fi
+
+        mkdir -p out
+        echo "Base config: $BASE_CONFIG"
+        echo "Device fragment: $DEVICE_CONFIG"
+
+        # 4.19 uses a common MT6768 base config plus device-specific and optional KernelSU fragments.
+        # Keep the KernelSU fragment last so its KSU choices take precedence.
+        if [ "${{ env.ENABLE_KERNELSU }}" = true ]; then
+            echo "KernelSU fragment: $KSU_CONFIG"
+            ./scripts/kconfig/merge_config.sh -m -O out "$BASE_CONFIG" "$DEVICE_CONFIG" "$KSU_CONFIG"
+        else
+            ./scripts/kconfig/merge_config.sh -m -O out "$BASE_CONFIG" "$DEVICE_CONFIG"
+        fi
+
+        CONFIG_FILE="$GITHUB_WORKSPACE/kernel_workspace/android-kernel/out/.config"
+
+        if [ "${{ env.ENABLE_KERNELSU }}" = true ]; then
+            if [ "${{ env.KSU_HOOKS_PATCH }}" = true ]; then
                 git apply $GITHUB_WORKSPACE/patches/KSU_HOOKS_PATCH.patch
-                if grep -q "CONFIG_KSU" arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig; then
-                    sed -i 's/# CONFIG_KSU is not set/CONFIG_KSU=y/g' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                    sed -i 's/CONFIG_KSU=n/CONFIG_KSU=y/g' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
+                if grep -q '^CONFIG_KSU=' "$CONFIG_FILE"; then
+                    sed -i 's/^CONFIG_KSU=.*/CONFIG_KSU=y/' "$CONFIG_FILE"
                 else
-                    echo "CONFIG_KSU=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
+                    echo 'CONFIG_KSU=y' >> "$CONFIG_FILE"
                 fi
             fi
-            if [ ${{ env.ADD_KPROBES_CONFIG }} = true -a ${{ env.KSU_HOOKS_PATCH }} != true ]; then
-                echo "CONFIG_MODULES=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                echo "CONFIG_KPROBES=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                echo "CONFIG_HAVE_KPROBES=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                echo "CONFIG_KPROBE_EVENTS=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
+            if [ "${{ env.ADD_KPROBES_CONFIG }}" = true ] && [ "${{ env.KSU_HOOKS_PATCH }}" != true ]; then
+                echo 'CONFIG_MODULES=y' >> "$CONFIG_FILE"
+                echo 'CONFIG_KPROBES=y' >> "$CONFIG_FILE"
+                echo 'CONFIG_HAVE_KPROBES=y' >> "$CONFIG_FILE"
+                echo 'CONFIG_KPROBE_EVENTS=y' >> "$CONFIG_FILE"
             fi
         fi
-        if [ ${{ env.ADD_OVERLAYFS_CONFIG }} = true ]; then
-            echo "CONFIG_OVERLAY_FS=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-            echo "CONFIG_OVERLAY_FS_REDIRECT_DIR=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-            echo "CONFIG_OVERLAY_FS_INDEX=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
+
+        if [ "${{ env.ADD_OVERLAYFS_CONFIG }}" = true ]; then
+            echo 'CONFIG_OVERLAY_FS=y' >> "$CONFIG_FILE"
+            echo 'CONFIG_OVERLAY_FS_REDIRECT_DIR=y' >> "$CONFIG_FILE"
+            echo 'CONFIG_OVERLAY_FS_INDEX=y' >> "$CONFIG_FILE"
         fi
-        if [ ${{ env.ADD_APATCH_SUPPORT }} = true ]; then
-                sed -i 's/# CONFIG_DEBUG_KERNEL is not set/CONFIG_DEBUG_KERNEL=y/g' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                sed -i 's/CONFIG_DEBUG_KERNEL=n/CONFIG_DEBUG_KERNEL=y/g' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                echo "CONFIG_DEBUG_KERNEL=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                sed -i 's/# CONFIG_KALLSYMS is not set/CONFIG_KALLSYMS=y/g' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                sed -i 's/CONFIG_KALLSYMS=n/CONFIG_KALLSYMS=y/g' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                echo "CONFIG_KALLSYMS=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                sed -i 's/# CONFIG_KALLSYMS_ALL is not set/CONFIG_KALLSYMS_ALL=y/g' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                sed -i 's/CONFIG_KALLSYMS_ALL=n/CONFIG_KALLSYMS_ALL=y/g' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                echo "CONFIG_KALLSYMS_ALL=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                sed -i 's/# CONFIG_KALLSYMS_BASE_RELATIVE is not set/CONFIG_KALLSYMS_BASE_RELATIVE=y/g' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                sed -i 's/CONFIG_KALLSYMS_BASE_RELATIVE=n/CONFIG_KALLSYMS_BASE_RELATIVE=y/g' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                echo "CONFIG_KALLSYMS_BASE_RELATIVE=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                if [ ${{ env.FIX_APATCH_OPENELA }} = true ]; then
-                    git apply $GITHUB_WORKSPACE/patches/FIX_APATCH_OPENELA.patch || {
+
+        if [ "${{ env.ADD_APATCH_SUPPORT }}" = true ]; then
+            sed -i 's/^# CONFIG_DEBUG_KERNEL is not set/CONFIG_DEBUG_KERNEL=y/' "$CONFIG_FILE"
+            sed -i 's/^CONFIG_DEBUG_KERNEL=n/CONFIG_DEBUG_KERNEL=y/' "$CONFIG_FILE"
+            echo 'CONFIG_DEBUG_KERNEL=y' >> "$CONFIG_FILE"
+            sed -i 's/^# CONFIG_KALLSYMS is not set/CONFIG_KALLSYMS=y/' "$CONFIG_FILE"
+            sed -i 's/^CONFIG_KALLSYMS=n/CONFIG_KALLSYMS=y/' "$CONFIG_FILE"
+            echo 'CONFIG_KALLSYMS=y' >> "$CONFIG_FILE"
+            sed -i 's/^# CONFIG_KALLSYMS_ALL is not set/CONFIG_KALLSYMS_ALL=y/' "$CONFIG_FILE"
+            sed -i 's/^CONFIG_KALLSYMS_ALL=n/CONFIG_KALLSYMS_ALL=y/' "$CONFIG_FILE"
+            echo 'CONFIG_KALLSYMS_ALL=y' >> "$CONFIG_FILE"
+            sed -i 's/^# CONFIG_KALLSYMS_BASE_RELATIVE is not set/CONFIG_KALLSYMS_BASE_RELATIVE=y/' "$CONFIG_FILE"
+            sed -i 's/^CONFIG_KALLSYMS_BASE_RELATIVE=n/CONFIG_KALLSYMS_BASE_RELATIVE=y/' "$CONFIG_FILE"
+            echo 'CONFIG_KALLSYMS_BASE_RELATIVE=y' >> "$CONFIG_FILE"
+            if [ "${{ env.FIX_APATCH_OPENELA }}" = true ]; then
+                git apply $GITHUB_WORKSPACE/patches/FIX_APATCH_OPENELA.patch || {
                     git apply $GITHUB_WORKSPACE/patches/REVERT_ADD_GET_CRED_RCU.patch
                     git apply $GITHUB_WORKSPACE/patches/FIX_APATCH_OPENELA.patch
-                    }
-                fi
-        fi
-        if [ ${{ env.DISABLE_LTO }} = true ]; then
-            sed -i 's/CONFIG_LTO=y/CONFIG_LTO=n/' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-            sed -i 's/CONFIG_LTO_CLANG=y/CONFIG_LTO_CLANG=n/' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-            sed -i 's/CONFIG_THINLTO=y/CONFIG_THINLTO=n/' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-            echo "CONFIG_LTO_NONE=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-        fi
-        if [ ${{ env.DISABLE_CC_WERROR }} = true ]; then
-            echo "CONFIG_CC_WERROR=n" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-        fi
-        if [ ${{ env.OLD_ANDROID_SUPPORT }} = true ]; then
-            git apply $GITHUB_WORKSPACE/patches/OLD_ANDROID_SUPPORT.patch
-            if grep -q "CONFIG_MMC_CRYPTO_LEGACY" arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig; then
-                sed -i 's/# CONFIG_MMC_CRYPTO_LEGACY is not set/CONFIG_MMC_CRYPTO_LEGACY=y/g' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-                sed -i 's/CONFIG_MMC_CRYPTO_LEGACY=n/CONFIG_MMC_CRYPTO_LEGACY=y/g' arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
-            else
-                echo "CONFIG_MMC_CRYPTO_LEGACY=y" >> arch/${{ env.KERNEL_ARCH }}/configs/${DEVICE}_defconfig
+                }
             fi
         fi
-        if [ ${{ env.FIX_WIFI_SPEED }} = true ]; then
+
+        if [ "${{ env.DISABLE_LTO }}" = true ]; then
+            sed -i 's/^CONFIG_LTO=y/CONFIG_LTO=n/' "$CONFIG_FILE"
+            sed -i 's/^CONFIG_LTO_CLANG=y/CONFIG_LTO_CLANG=n/' "$CONFIG_FILE"
+            sed -i 's/^CONFIG_THINLTO=y/CONFIG_THINLTO=n/' "$CONFIG_FILE"
+            echo 'CONFIG_LTO_NONE=y' >> "$CONFIG_FILE"
+        fi
+
+        if [ "${{ env.DISABLE_CC_WERROR }}" = true ]; then
+            echo 'CONFIG_CC_WERROR=n' >> "$CONFIG_FILE"
+        fi
+
+        if [ "${{ env.OLD_ANDROID_SUPPORT }}" = true ]; then
+            git apply $GITHUB_WORKSPACE/patches/OLD_ANDROID_SUPPORT.patch
+            if grep -q '^CONFIG_MMC_CRYPTO_LEGACY=' "$CONFIG_FILE"; then
+                sed -i 's/^CONFIG_MMC_CRYPTO_LEGACY=.*/CONFIG_MMC_CRYPTO_LEGACY=y/' "$CONFIG_FILE"
+            else
+                echo 'CONFIG_MMC_CRYPTO_LEGACY=y' >> "$CONFIG_FILE"
+            fi
+        fi
+
+        if [ "${{ env.FIX_WIFI_SPEED }}" = true ]; then
             rm -rf drivers/misc/mediatek/connectivity
             cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel/drivers/misc/mediatek
             git clone https://github.com/Jbub5/connectivity.git --depth=1
             cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         fi
+
+        # Dependency/default resolution is intentionally deferred to the Build kernel step,
+        # where the selected compiler and LLVM/GCC arguments are already active.
 
     - name: Setup ccache
       if: env.ENABLE_CCACHE == 'true'
@@ -284,19 +380,26 @@ jobs:
         fi
         export KBUILD_BUILD_HOST=Github-Action
         export KBUILD_BUILD_USER=$(echo ${{ github.actor }} | tr A-Z a-z)
-        if [ -n ${{ env.KSU_EXPECTED_SIZE }} ] && [ -n ${{ env.KSU_EXPECTED_HASH }} ]; then
+        if [ -n "${{ env.KSU_EXPECTED_SIZE }}" ] && [ -n "${{ env.KSU_EXPECTED_HASH }}" ]; then
           export KSU_EXPECTED_SIZE=${{ env.KSU_EXPECTED_SIZE }}
           export KSU_EXPECTED_HASH=${{ env.KSU_EXPECTED_HASH }}
         fi
-        make -j$(nproc --all) CC=clang O=out ARCH=${{ env.KERNEL_ARCH }} ${{ env.EXTRA_CMDS }} ${DEVICE}_defconfig
-        if [ ${{ env.ENABLE_CCACHE }} = true ]; then
-            if [ ${{ env.USE_GCC }} = true ]; then
+        # Resolve Kconfig with the exact same compiler/tool arguments used for compilation.
+        # This prevents --syncconfig from discovering compiler-dependent (NEW) symbols mid-build.
+        if [ "${{ env.USE_GCC }}" = "true" ]; then
+            make O=out ARCH=${{ env.KERNEL_ARCH }} CC=gcc ${{ env.EXTRA_CMDS }} olddefconfig
+        else
+            make O=out ARCH=${{ env.KERNEL_ARCH }} CC=clang ${{ env.EXTRA_CMDS }} olddefconfig
+        fi
+
+        if [ "${{ env.ENABLE_CCACHE }}" = "true" ]; then
+            if [ "${{ env.USE_GCC }}" = "true" ]; then
                 make -j$(nproc --all) CC="ccache gcc" O=out ARCH=${{ env.KERNEL_ARCH }} ${{ env.EXTRA_CMDS }}
             else
                 make -j$(nproc --all) CC="ccache clang" O=out ARCH=${{ env.KERNEL_ARCH }} ${{ env.EXTRA_CMDS }}
             fi
         else
-            if [ ${{ env.USE_GCC }} = true ]; then
+            if [ "${{ env.USE_GCC }}" = "true" ]; then
                 make -j$(nproc --all) CC=gcc O=out ARCH=${{ env.KERNEL_ARCH }} ${{ env.EXTRA_CMDS }}
             else
                 make -j$(nproc --all) CC=clang O=out ARCH=${{ env.KERNEL_ARCH }} ${{ env.EXTRA_CMDS }}
@@ -321,6 +424,22 @@ jobs:
            fi
        fi
 
+    - name: Patch xxksu Ultra KPM
+      if: env.CHECK_FILE_IS_OK == 'true' && env.KPM_SUPPORT == 'true'
+      run: |
+        OUT_BOOT=$GITHUB_WORKSPACE/kernel_workspace/android-kernel/out/arch/${{ env.KERNEL_ARCH }}/boot
+        mkdir $GITHUB_WORKSPACE/kernel_workspace/xxksu-Patch
+        cd $GITHUB_WORKSPACE/kernel_workspace/xxksu-Patch
+        wget ${{ env.KPM_URL }}
+        cp $OUT_BOOT/Image ./
+        cp $OUT_BOOT/dts/mediatek/mt6768.dtb ./
+        chmod +x patch_linux
+        ./patch_linux
+        mv -f oImage Image
+        gzip -k Image
+        cat Image.gz *.dtb > Image.gz-dtb
+        mv -f Image.gz-dtb $OUT_BOOT/${{ env.KERNEL_IMAGE_NAME }}
+
     - name: Create flashable Anykernel3 zip
       if: env.CHECK_FILE_IS_OK == 'true' && env.USE_ANYKERNEL3 == 'true'
       run: |
@@ -338,7 +457,7 @@ jobs:
         elif [[ ${{ env.ANYKERNEL3_SOURCE }} == *'.tar.zst' ]]; then
             wget -nv -O AnyKernel3.tar.zst ${{ env.ANYKERNEL3_SOURCE }}
             mkdir AnyKernel3
-            tar -C AnyKernel3/ -I zstd -xf clang.tar.zst
+            tar -C AnyKernel3/ -I zstd -xf AnyKernel3.tar.zst
             rm AnyKernel3.tar.zst
         elif [[ ${{ env.ANYKERNEL3_SOURCE }} == *'.git' ]]; then
             git clone ${{ env.ANYKERNEL3_SOURCE }} -b ${{ env.ANYKERNEL3_BRANCH }} --depth=1 AnyKernel3
@@ -368,30 +487,38 @@ jobs:
             exit 1
         fi
 
+    - name: Export kernel name from defconfig
+      run: |
+        DEFCONFIG_FILE="kernel_workspace/android-kernel/out/.config"
+        RAW_LOCALVERSION=$(grep -oP 'CONFIG_LOCALVERSION="\K[^"]+' "$DEFCONFIG_FILE" || true)
+        KERNEL_NAME=$(echo "$RAW_LOCALVERSION" | sed 's/^-//')
+        [ -z "$KERNEL_NAME" ] && KERNEL_NAME="CustomKernel"
+        echo "KERNEL_LOCALVERSION=${KERNEL_NAME}" >> $GITHUB_ENV
+
     - name: Upload AnyKernel3
       if: env.CHECK_FILE_IS_OK == 'true'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
-        name: AnyKernel3${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
+        name: ${{ env.ANDROID_TAG }}${{ env.KERNEL_LOCALVERSION }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
         path: kernel_workspace/AnyKernel3/*
 
-    - name: Upload kernel image
+    - name: Upload Kernel Image
       if: env.CHECK_FILE_IS_OK == 'true'
-      uses: actions/upload-artifact@v4
-      with:
+      uses: actions/upload-artifact@v6
+      with:        
         name: ${{ env.KERNEL_IMAGE_NAME }}${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
         path: kernel_workspace/android-kernel/out/arch/${{ env.KERNEL_ARCH }}/boot/${{ env.KERNEL_IMAGE_NAME }}
 
     - name: Upload DTBO image
       if: env.CHECK_DTBO_IS_OK == 'true'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: dtbo-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
         path: kernel_workspace/android-kernel/out/arch/${{ env.KERNEL_ARCH }}/boot/dtbo.img
 
     - name: Upload boot image
       if: env.MAKE_BOOT_IMAGE_IS_OK == 'true'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: boot${{ env.LOCALVERSION }}${{ env.UPLOADNAME }}-${{ env.DEVICE }}-${{ env.BUILD_TIME }}
         path: kernel_workspace/boot.img
